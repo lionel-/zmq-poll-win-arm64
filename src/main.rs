@@ -1,3 +1,9 @@
+// Force link advapi32 on Windows (needed by zeromq-src for
+// InitializeSecurityDescriptor / SetSecurityDescriptorDacl)
+#[cfg(windows)]
+#[link(name = "advapi32")]
+extern "system" {}
+
 //
 // Minimal reproducer for zmq_poll() blocking forever on Windows ARM64.
 //
