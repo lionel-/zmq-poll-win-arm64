@@ -80,8 +80,27 @@ fn test_tcp_pubsub() {
     subscriber.set_subscribe(b"").unwrap();
     subscriber.connect(&endpoint).unwrap();
 
-    // Wait for subscription to propagate, then send
-    std::thread::sleep(Duration::from_millis(200));
+    // PUB/SUB subscription propagation can be slow, especially on
+    // Windows ARM. Send repeatedly until the subscriber sees a message.
+    let start = Instant::now();
+    loop {
+        publisher.send("hello", 0).unwrap();
+        // Use poll(0) + sleep, not poll(100), because poll with
+        // non-zero timeout is the exact bug we're reproducing.
+        std::thread::sleep(Duration::from_millis(100));
+        if subscriber.poll(zmq::POLLIN, 0).unwrap() > 0 {
+            // Consume the message
+            let _ = subscriber.recv_msg(0).unwrap();
+            println!("  (subscription propagated in {:?})", start.elapsed());
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            println!("  FAIL — subscription never propagated after 5s");
+            std::process::exit(1);
+        }
+    }
+
+    // Now send the actual test message
     publisher.send("hello", 0).unwrap();
     std::thread::sleep(Duration::from_millis(50));
 
