@@ -1,0 +1,30 @@
+name: "ZMQ poll reprex"
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: "${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+          - windows-11-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report Rust Toolchain
+        run: rustup show
+
+      - name: Build
+        run: cargo build
+
+      - name: Run reprex
+        run: cargo run
