@@ -42,6 +42,7 @@ fn main() {
     test_tcp_pair();
     test_tcp_xpub_sub();
     test_tcp_delayed_send();
+    test_multi_socket_poll();
 
     println!();
     println!("All tests passed.");
@@ -163,6 +164,81 @@ fn test_tcp_delayed_send() {
     }
 
     let _ = receiver.recv_msg(0).unwrap();
+}
+
+/// The actual kernel pattern: `zmq_poll` on multiple items including an
+/// inproc notification socket + TCP sockets. Data arrives on the inproc
+/// socket from another thread while poll is blocking.
+fn test_multi_socket_poll() {
+    println!();
+    println!("=== Multi-socket poll (inproc notif + TCP, kernel pattern) ===");
+
+    let ctx = zmq::Context::new();
+
+    // Inproc PAIR for cross-thread notifications (like outbound_notif_socket)
+    let notif_tx = ctx.socket(zmq::PAIR).unwrap();
+    let notif_rx = ctx.socket(zmq::PAIR).unwrap();
+    notif_rx.bind("inproc://notif").unwrap();
+    notif_tx.connect("inproc://notif").unwrap();
+
+    // TCP sockets (like stdin + iopub in the bridge thread)
+    let tcp1_a = ctx.socket(zmq::PAIR).unwrap();
+    let tcp1_b = ctx.socket(zmq::PAIR).unwrap();
+    tcp1_a.bind("tcp://127.0.0.1:*").unwrap();
+    let ep1 = tcp1_a.get_last_endpoint().unwrap().unwrap();
+    tcp1_b.connect(&ep1).unwrap();
+
+    let tcp2_a = ctx.socket(zmq::PAIR).unwrap();
+    let tcp2_b = ctx.socket(zmq::PAIR).unwrap();
+    tcp2_a.bind("tcp://127.0.0.1:*").unwrap();
+    let ep2 = tcp2_a.get_last_endpoint().unwrap().unwrap();
+    tcp2_b.connect(&ep2).unwrap();
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Poll on all three rx sockets (inproc + 2x TCP), notification
+    // arrives on the inproc socket from another thread
+    print!("  zmq_poll on [inproc, tcp, tcp], notif on inproc 200ms later ... ");
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let done2 = done.clone();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        notif_tx.send("wake", 0).unwrap();
+    });
+
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(5));
+        if !done2.load(Ordering::Relaxed) {
+            eprintln!();
+            eprintln!("  HANG DETECTED \u{2014} zmq_poll did not wake for inproc notification");
+            eprintln!("  This is the kernel pattern: bridge thread polls inproc + TCP");
+            eprintln!("  and the inproc notification never wakes the poll.");
+            std::process::exit(2);
+        }
+    });
+
+    let mut poll_items = vec![
+        notif_rx.as_poll_item(zmq::POLLIN),
+        tcp1_b.as_poll_item(zmq::POLLIN),
+        tcp2_b.as_poll_item(zmq::POLLIN),
+    ];
+
+    let start = Instant::now();
+    let n = zmq::poll(&mut poll_items, 5000).unwrap();
+    let elapsed = start.elapsed();
+    done.store(true, Ordering::Relaxed);
+
+    if n > 0 && elapsed < Duration::from_secs(2) {
+        println!("OK ({elapsed:?})");
+    } else if n > 0 {
+        println!("SLOW ({elapsed:?}), poll was slow to wake");
+    } else {
+        println!("FAIL \u{2014} zmq_poll timed out, took {elapsed:?}");
+        std::process::exit(1);
+    }
+
+    let _ = notif_rx.recv_msg(0).unwrap();
 }
 
 fn run_poll_tests(socket: &zmq::Socket, label: &'static str) {
