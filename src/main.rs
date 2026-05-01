@@ -41,6 +41,7 @@ fn main() {
 
     test_tcp_pair();
     test_tcp_xpub_sub();
+    test_tcp_delayed_send();
 
     println!();
     println!("All tests passed.");
@@ -105,6 +106,63 @@ fn test_tcp_xpub_sub() {
     std::thread::sleep(Duration::from_millis(50));
 
     run_poll_tests(&sub, "TCP XPUB/SUB");
+}
+
+/// The actual kernel scenario: poll is already blocking when data
+/// arrives from another thread over TCP.
+fn test_tcp_delayed_send() {
+    println!();
+    println!("=== TCP PAIR delayed send (data arrives while poll is blocking) ===");
+
+    let ctx = zmq::Context::new();
+    let sender = ctx.socket(zmq::PAIR).unwrap();
+    let receiver = ctx.socket(zmq::PAIR).unwrap();
+
+    sender.bind("tcp://127.0.0.1:*").unwrap();
+    let endpoint = sender.get_last_endpoint().unwrap().unwrap();
+    receiver.connect(&endpoint).unwrap();
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    print!("  poll(5000) with data arriving 200ms later ... ");
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let done2 = done.clone();
+
+    // Producer: send after a short delay
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        sender.send("delayed", 0).unwrap();
+    });
+
+    // Watchdog
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(5));
+        if !done2.load(Ordering::Relaxed) {
+            eprintln!();
+            eprintln!(
+                "  HANG DETECTED \u{2014} poll(5000) did not wake when data arrived"
+            );
+            eprintln!("  This is the scenario that breaks the kernel: a blocking");
+            eprintln!("  poll never wakes for data sent by another thread.");
+            std::process::exit(2);
+        }
+    });
+
+    let start = Instant::now();
+    let ready = receiver.poll(zmq::POLLIN, 5000).unwrap();
+    let elapsed = start.elapsed();
+    done.store(true, Ordering::Relaxed);
+
+    if ready > 0 && elapsed < Duration::from_secs(2) {
+        println!("OK ({elapsed:?})");
+    } else if ready > 0 {
+        println!("SLOW ({elapsed:?}), poll was slow to wake");
+    } else {
+        println!("FAIL \u{2014} poll(5000) timed out, took {elapsed:?}");
+        std::process::exit(1);
+    }
+
+    let _ = receiver.recv_msg(0).unwrap();
 }
 
 fn run_poll_tests(socket: &zmq::Socket, label: &'static str) {
